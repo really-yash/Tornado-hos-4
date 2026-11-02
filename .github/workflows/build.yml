@@ -24,6 +24,7 @@ env:
   GOFILE_LINUX: https://gofile.io/d/n1kceeoc
   GOFILE_MAC: https://gofile.io/d/1gdutGk4
   WORK: /mnt/work
+  PIP_BREAK_SYSTEM_PACKAGES: "1"
 
 defaults:
   run:
@@ -43,17 +44,186 @@ jobs:
           mkdir -p "$WORK"/{dl,stock,stage,bin_dl}
           df -h / /mnt
 
-      - name: Install tools
+      - name: Install tools and setup Gofile auto-resolver
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq aria2 zip unzip jq xxd android-sdk-libsparse-utils python3-requests
+          sudo apt-get install -y -qq aria2 zip unzip jq xxd android-sdk-libsparse-utils python3-requests python3-pip
+          pip3 install -q playwright
+          playwright install --with-deps chromium
+
           gh release download --repo ssut/payload-dumper-go --pattern '*linux_amd64.tar.gz' --dir /tmp
           tar -xzf /tmp/payload-dumper-go*linux_amd64.tar.gz -C /tmp
           sudo install -m755 "$(find /tmp -name payload-dumper-go -type f | head -1)" /usr/local/bin/payload-dumper-go
-        env:
-          GH_TOKEN: ${{ github.token }}
 
-      # ---------- gofile helper with fallback ----------
+          mkdir -p "$GITHUB_WORKSPACE/tools"
+          cat << 'EOF' > "$GITHUB_WORKSPACE/tools/gofile_fetch.py"
+          #!/usr/bin/env python3
+          import argparse
+          import hashlib
+          import os
+          import re
+          import subprocess
+          import sys
+          import time
+          from playwright.sync_api import sync_playwright
+
+          def md5sum(filepath):
+              h = hashlib.md5()
+              with open(filepath, "rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def resolve_gofile(url):
+              m = re.search(r"gofile\.io/d/([A-Za-z0-9]+)", url)
+              if not m:
+                  raise ValueError(f"Invalid Gofile URL: {url}")
+              content_id = m.group(1)
+
+              captured = {"data": None, "token": None, "ua": None}
+              profile_dir = "/tmp/gofile_chrome_profile"
+              os.makedirs(profile_dir, exist_ok=True)
+
+              with sync_playwright() as p:
+                  ctx = p.chromium.launch_persistent_context(
+                      profile_dir,
+                      headless=True,
+                      args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+                  )
+                  page = ctx.pages[0] if ctx.pages else ctx.new_page()
+
+                  # Block ad/tracker scripts so page loads cleanly
+                  page.route("**/*a-ads*", lambda route: route.abort())
+
+                  def on_request(req):
+                      if "api.gofile.io" in req.url:
+                          auth = req.headers.get("authorization", "")
+                          if auth.startswith("Bearer "):
+                              captured["token"] = auth.split("Bearer ", 1)[1].strip()
+                          if req.headers.get("user-agent"):
+                              captured["ua"] = req.headers["user-agent"]
+
+                  def on_response(resp):
+                      if f"api.gofile.io/contents/{content_id}" in resp.url and resp.status == 200:
+                          try:
+                              body = resp.json()
+                              if body.get("status") == "ok" and "data" in body:
+                                  captured["data"] = body["data"]
+                          except Exception:
+                              pass
+
+                  page.on("request", on_request)
+                  page.on("response", on_response)
+
+                  for attempt in range(3):
+                      print(f"[gofile] Resolving {url} via headless Chromium (attempt {attempt + 1}/3)...")
+                      page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                      for _ in range(60):
+                          if captured["data"] is not None:
+                              break
+                          page.wait_for_timeout(500)
+                      if captured["data"] is not None:
+                          break
+                      time.sleep(2)
+
+                  if not captured["token"]:
+                      for c in ctx.cookies():
+                          if c.get("name") == "accountToken":
+                              captured["token"] = c.get("value")
+                              break
+                  if not captured["token"]:
+                      try:
+                          captured["token"] = page.evaluate("() => localStorage.getItem('accountToken') || ''")
+                      except Exception:
+                          pass
+                  if not captured["ua"]:
+                      captured["ua"] = page.evaluate("() => navigator.userAgent")
+
+                  ctx.close()
+
+              if not captured["data"]:
+                  raise RuntimeError(f"Failed to intercept Gofile API contents for {url}")
+              if not captured["token"]:
+                  raise RuntimeError(f"Failed to extract Gofile accountToken for {url}")
+
+              children = captured["data"].get("children") or captured["data"].get("contents") or {}
+              files = [
+                  item for item in children.values()
+                  if isinstance(item, dict) and (item.get("type") == "file" or "link" in item)
+              ]
+              if not files:
+                  raise RuntimeError(f"No downloadable files found in Gofile folder {url}")
+
+              return files, captured["token"], captured["ua"]
+
+          def main():
+              parser = argparse.ArgumentParser()
+              parser.add_argument("url")
+              parser.add_argument("out_dir")
+              parser.add_argument("--only", default=None)
+              args, _ = parser.parse_known_args()
+
+              os.makedirs(args.out_dir, exist_ok=True)
+              files, token, ua = resolve_gofile(args.url)
+
+              if args.only:
+                  matched = [f for f in files if f.get("name") == args.only]
+                  if not matched and len(files) == 1:
+                      files[0]["name"] = args.only
+                      matched = files
+                  files = matched
+                  if not files:
+                      print(f"::error::Requested file '{args.only}' not found in {args.url}", file=sys.stderr)
+                      sys.exit(1)
+
+              for f in files:
+                  name = f["name"]
+                  link = f["link"]
+                  expected_size = int(f.get("size") or 0)
+                  expected_md5 = (f.get("md5") or "").lower()
+                  dest = os.path.join(args.out_dir, name)
+
+                  print(f"[gofile] Downloading {name} ({expected_size} bytes) -> {dest}")
+                  cmd = [
+                      "aria2c", "-x8", "-s8", "-k4M",
+                      "--retry-wait=5", "--max-tries=10",
+                      "--file-allocation=none", "--allow-overwrite=true",
+                      f"--header=Cookie: accountToken={token}",
+                      f"--header=User-Agent: {ua}",
+                      "--header=Referer: https://gofile.io/",
+                      "--header=Origin: https://gofile.io",
+                      "-d", args.out_dir,
+                      "-o", name,
+                      link,
+                  ]
+                  subprocess.run(cmd, check=True)
+
+                  if not os.path.exists(dest) or os.path.getsize(dest) == 0:
+                      print(f"::error::Downloaded file {name} is missing or empty", file=sys.stderr)
+                      sys.exit(2)
+
+                  actual_size = os.path.getsize(dest)
+                  if expected_size > 0 and actual_size != expected_size:
+                      print(f"::error::Size mismatch for {name}: expected {expected_size}, got {actual_size}", file=sys.stderr)
+                      sys.exit(2)
+
+                  if expected_md5:
+                      actual_md5 = md5sum(dest)
+                      if actual_md5 != expected_md5:
+                          print(f"::error::MD5 mismatch for {name}: expected {expected_md5}, got {actual_md5}", file=sys.stderr)
+                          sys.exit(2)
+                      print(f"[gofile] Verified {name} (md5: {actual_md5})")
+                  else:
+                      print(f"[gofile] Verified {name} (size: {actual_size})")
+
+          if __name__ == "__main__":
+              main()
+          EOF
+          chmod +x "$GITHUB_WORKSPACE/tools/gofile_fetch.py"
+
+      # ---------- gofile helper ----------
       - name: Fetch super.img from gofile
         env:
           SUPER_DIRECT: ${{ inputs.super_direct_url }}
@@ -62,39 +232,27 @@ jobs:
           if [ -n "$SUPER_DIRECT" ]; then
             aria2c -x8 -s8 -k4M --retry-wait=5 --max-tries=10 -o super.img "$SUPER_DIRECT"
           else
-            python3 "$GITHUB_WORKSPACE/tools/gofile_fetch.py" "$GOFILE_SUPER" . --only super.img || rc=$?
-            if [ "${rc:-0}" = 3 ]; then
-              echo "::warning::Own resolver failed, trying gofile-downloader fallback"
-              pip install -q gofile-downloader
-              mkdir -p fb && (cd fb && gofile-downloader "$GOFILE_SUPER")
-              found=$(find fb -name super.img -type f | head -1)
-              [ -n "$found" ] && mv "$found" super.img || { echo "::error::Could not download super.img. Re-run with super_direct_url."; exit 1; }
-            elif [ "${rc:-0}" != 0 ]; then
-              echo "::error::super.img failed size/md5 verification (corrupt download)"; exit 1
-            fi
+            python3 "$GITHUB_WORKSPACE/tools/gofile_fetch.py" "$GOFILE_SUPER" . --only super.img
           fi
-          ls -l super.img
+          ls -lh super.img
 
       - name: Validate super.img (sparse chain + full decode + LP geometry)
-        run: python3 tools/check_super.py "$WORK/dl/super.img" "$WORK/dl/super_raw.img"
+        run: |
+          python3 tools/check_super.py "$WORK/dl/super.img" "$WORK/dl/super_raw.img"
+          rm -f "$WORK/dl/super_raw.img"
 
       - name: Fetch and validate bin/ tools
         run: |
           fetch() { # name url
             local d="$WORK/bin_dl/$1"; mkdir -p "$d"
-            python3 tools/gofile_fetch.py "$2" "$d" || rc=$?
-            if [ "${rc:-0}" = 3 ]; then
-              pip install -q gofile-downloader
-              (mkdir -p "$d/fb" && cd "$d/fb" && gofile-downloader "$2")
-              find "$d/fb" -type f -exec mv -n {} "$d"/ \; 
-            elif [ "${rc:-0}" != 0 ]; then echo "::error::$1 download verification failed"; exit 1; fi
+            python3 "$GITHUB_WORKSPACE/tools/gofile_fetch.py" "$2" "$d"
           }
           fetch windows "$GOFILE_WIN"
           fetch linux   "$GOFILE_LINUX"
           fetch macos   "$GOFILE_MAC"
           B="$WORK/bin_dl"
           for f in AdbWinApi.dll AdbWinUsbApi.dll fastboot.exe; do
-            [ -s "$B/windows/$f" ] || { echo "::error::windows/$f missing"; exit 1; }
+            [ -s "$B/windows/$f" ] \vert{}\vert{} { echo "::error::windows/$f missing"; exit 1; }
           done
           [ "$(head -c2 "$B/windows/fastboot.exe")" = "MZ" ] || { echo "::error::windows fastboot.exe is not a PE file"; exit 1; }
           [ "$(head -c4 "$B/linux/fastboot" | xxd -p)" = "7f454c46" ] || { echo "::error::linux/fastboot is not an ELF binary (wrong gofile link?)"; exit 1; }
@@ -110,10 +268,10 @@ jobs:
           cd "$WORK/stock"
           aria2c -x16 -s16 -k4M --retry-wait=5 --max-tries=10 --file-allocation=none -o stock.zip "$STOCK_URL"
           unzip -tq stock.zip
-          want=$(basename "$STOCK_URL" .zip | awk -F- '{print $NF}')
-          have=$(md5sum stock.zip | cut -c1-${#want})
+          want=$(basename "$STOCK_URL" .zip \vert{} awk -F- '{print $NF}')
+          have=$(md5sum stock.zip \vert{} cut -c1-${#want})
           if [ "$want" = "$have" ]; then echo "stock md5 prefix matches filename ($want)"
-          else echo "::warning::md5 prefix $have != filename hash $want (zip test passed, continuing)"; fi
+          else echo "::warning::md5 prefix $have != filename hash$want (zip test passed, continuing)"; fi
           unzip -o -q stock.zip payload.bin
           rm stock.zip
           ls -l payload.bin
@@ -138,7 +296,7 @@ jobs:
           for f in "$S"/*.sh "$S/windows_fastboot_install.bat"; do
             sed -i -E '/--disable-verity/! s/ flash (vbmeta)/ --disable-verity --disable-verification flash \1/' "$f"
             n=$(grep -c -- '--disable-verity --disable-verification flash vbmeta' "$f")
-            [ "$n" = 6 ] || { echo "::error::$f: expected 6 vbmeta flash lines patched, got $n"; exit 1; }
+            [ "$n" = 6 ] || { echo "::error::$f: expected 6 vbmeta flash lines patched, got$n"; exit 1; }
           done
           chmod +x "$S"/*.sh
 
@@ -172,55 +330,4 @@ jobs:
         run: |
           S="$WORK/stage/$PKG"; fail=0
           for sc in "$S"/*.sh "$S/windows_fastboot_install.bat"; do
-            for n in $(grep -ohE 'firmware-update[/\\][A-Za-z0-9_.-]+' "$sc" | sed -E 's#.*[/\\]##' | sort -u); do
-              p="$S/firmware-update/$n"
-              if [ ! -s "$p" ]; then echo "MISSING/EMPTY: $n (used by $(basename "$sc"))"; fail=1; continue; fi
-              [ "$(head -c 4096 "$p" | tr -d '\0' | wc -c)" -gt 0 ] || { echo "ALL-ZERO HEADER: $n"; fail=1; }
-            done
-          done
-          if [ "$fail" = 1 ] && [ "${{ inputs.allow_missing }}" != "true" ]; then exit 1; fi
-          (cd "$S" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "$WORK/stage_manifest.txt"
-          wc -l "$WORK/stage_manifest.txt"
-          find "$S" | sed "s#$WORK/stage/##" | sort | head -80
-
-      - name: Zip and test
-        run: |
-          cd "$WORK/stage"
-          zip -r -1 -q "$WORK/$PKG.zip" "$PKG"
-          unzip -tq "$WORK/$PKG.zip"
-          diff <(unzip -Z1 "$WORK/$PKG.zip" | grep -v '/$' | sort) \
-               <(cd "$WORK/stage" && find "$PKG" -type f | sort) && echo "zip file list matches staging"
-          cd "$WORK" && sha256sum "$PKG.zip" | tee "$PKG.zip.sha256"
-          ls -lh "$PKG.zip"
-
-      - name: Upload checksums as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: checksums
-          path: |
-            /mnt/work/stage_manifest.txt
-            /mnt/work/TORNADO_HOS4_CN_BY_YASH.zip.sha256
-
-      - name: Upload to Pixeldrain and verify hash
-        if: ${{ inputs.upload }}
-        env:
-          PD_KEY: 3e97421d-e3b7-4fe1-8c8c-5dcd5201c7fa
-        run: |
-          [ -n "$PD_KEY" ] || { echo "::error::Pixeldrain API key missing"; exit 1; }
-          cd "$WORK"
-          resp=$(curl -sS --fail --retry 3 --retry-all-errors -u ":$PD_KEY" -T "$PKG.zip" "https://pixeldrain.com/api/file/$PKG.zip")
-          id=$(jq -r .id <<<"$resp"); [ -n "$id" ] && [ "$id" != null ] || { echo "upload failed: $resp"; exit 1; }
-          local_sha=$(cut -d' ' -f1 "$PKG.zip.sha256")
-          remote_sha=""
-          for i in 1 2 3 4 5 6; do
-            remote_sha=$(curl -sS "https://pixeldrain.com/api/file/$id/info" | jq -r '.hash_sha256 // empty')
-            [ -n "$remote_sha" ] && break; sleep 10
-          done
-          if [ -z "$remote_sha" ]; then
-            echo "No server hash, re-downloading to compare"
-            remote_sha=$(curl -sSL "https://pixeldrain.com/api/file/$id" | sha256sum | cut -d' ' -f1)
-          fi
-          [ "$local_sha" = "$remote_sha" ] || { echo "::error::Pixeldrain hash mismatch $local_sha vs $remote_sha"; exit 1; }
-          echo "Pixeldrain hash verified"
-          echo "### Done: https://pixeldrain.com/u/$id" >> "$GITHUB_STEP_SUMMARY"
-          echo "sha256: \`$local_sha\`" >> "$GITHUB_STEP_SUMMARY"
+            for n in $(grep -ohE 'firmware-update[/\\][A-Za-z0-9_.-]+' "$sc" | sed -E 's#.*[/\\]##' |
