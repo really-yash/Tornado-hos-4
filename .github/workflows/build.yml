@@ -252,7 +252,7 @@ jobs:
           fetch macos   "$GOFILE_MAC"
           B="$WORK/bin_dl"
           for f in AdbWinApi.dll AdbWinUsbApi.dll fastboot.exe; do
-            [ -s "$B/windows/$f" ] \vert{}\vert{} { echo "::error::windows/$f missing"; exit 1; }
+            [ -s "$B/windows/$f" ] || { echo "::error::windows/$f missing"; exit 1; }
           done
           [ "$(head -c2 "$B/windows/fastboot.exe")" = "MZ" ] || { echo "::error::windows fastboot.exe is not a PE file"; exit 1; }
           [ "$(head -c4 "$B/linux/fastboot" | xxd -p)" = "7f454c46" ] || { echo "::error::linux/fastboot is not an ELF binary (wrong gofile link?)"; exit 1; }
@@ -268,10 +268,10 @@ jobs:
           cd "$WORK/stock"
           aria2c -x16 -s16 -k4M --retry-wait=5 --max-tries=10 --file-allocation=none -o stock.zip "$STOCK_URL"
           unzip -tq stock.zip
-          want=$(basename "$STOCK_URL" .zip \vert{} awk -F- '{print $NF}')
-          have=$(md5sum stock.zip \vert{} cut -c1-${#want})
+          want=$(basename "$STOCK_URL" .zip | awk -F- '{print $NF}')
+          have=$(md5sum stock.zip | cut -c1-${#want})
           if [ "$want" = "$have" ]; then echo "stock md5 prefix matches filename ($want)"
-          else echo "::warning::md5 prefix $have != filename hash$want (zip test passed, continuing)"; fi
+          else echo "::warning::md5 prefix $have != filename hash $want (zip test passed, continuing)"; fi
           unzip -o -q stock.zip payload.bin
           rm stock.zip
           ls -l payload.bin
@@ -296,7 +296,7 @@ jobs:
           for f in "$S"/*.sh "$S/windows_fastboot_install.bat"; do
             sed -i -E '/--disable-verity/! s/ flash (vbmeta)/ --disable-verity --disable-verification flash \1/' "$f"
             n=$(grep -c -- '--disable-verity --disable-verification flash vbmeta' "$f")
-            [ "$n" = 6 ] || { echo "::error::$f: expected 6 vbmeta flash lines patched, got$n"; exit 1; }
+            [ "$n" = 6 ] || { echo "::error::$f: expected 6 vbmeta flash lines patched, got $n"; exit 1; }
           done
           chmod +x "$S"/*.sh
 
@@ -330,4 +330,55 @@ jobs:
         run: |
           S="$WORK/stage/$PKG"; fail=0
           for sc in "$S"/*.sh "$S/windows_fastboot_install.bat"; do
-            for n in $(grep -ohE 'firmware-update[/\\][A-Za-z0-9_.-]+' "$sc" | sed -E 's#.*[/\\]##' |
+            for n in $(grep -ohE 'firmware-update[/\\][A-Za-z0-9_.-]+' "$sc" | sed -E 's#.*[/\\]##' | sort -u); do
+              p="$S/firmware-update/$n"
+              if [ ! -s "$p" ]; then echo "MISSING/EMPTY: $n (used by $(basename "$sc"))"; fail=1; continue; fi
+              [ "$(head -c 4096 "$p" | tr -d '\0' | wc -c)" -gt 0 ] || { echo "ALL-ZERO HEADER: $n"; fail=1; }
+            done
+          done
+          if [ "$fail" = 1 ] && [ "${{ inputs.allow_missing }}" != "true" ]; then exit 1; fi
+          (cd "$S" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "$WORK/stage_manifest.txt"
+          wc -l "$WORK/stage_manifest.txt"
+          find "$S" | sed "s#$WORK/stage/##" | sort | head -80
+
+      - name: Zip and test
+        run: |
+          cd "$WORK/stage"
+          zip -r -1 -q "$WORK/$PKG.zip" "$PKG"
+          unzip -tq "$WORK/$PKG.zip"
+          diff <(unzip -Z1 "$WORK/$PKG.zip" | grep -v '/$' | sort) \
+               <(cd "$WORK/stage" && find "$PKG" -type f | sort) && echo "zip file list matches staging"
+          cd "$WORK" && sha256sum "$PKG.zip" | tee "$PKG.zip.sha256"
+          ls -lh "$PKG.zip"
+
+      - name: Upload checksums as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: checksums
+          path: |
+            /mnt/work/stage_manifest.txt
+            /mnt/work/TORNADO_HOS4_CN_BY_YASH.zip.sha256
+
+      - name: Upload to Pixeldrain and verify hash
+        if: ${{ inputs.upload }}
+        env:
+          PD_KEY: 3e97421d-e3b7-4fe1-8c8c-5dcd5201c7fa
+        run: |
+          [ -n "$PD_KEY" ] || { echo "::error::Pixeldrain API key missing"; exit 1; }
+          cd "$WORK"
+          resp=$(curl -sS --fail --retry 3 --retry-all-errors -u ":$PD_KEY" -T "$PKG.zip" "https://pixeldrain.com/api/file/$PKG.zip")
+          id=$(jq -r .id <<<"$resp"); [ -n "$id" ] && [ "$id" != null ] || { echo "upload failed: $resp"; exit 1; }
+          local_sha=$(cut -d' ' -f1 "$PKG.zip.sha256")
+          remote_sha=""
+          for i in 1 2 3 4 5 6; do
+            remote_sha=$(curl -sS "https://pixeldrain.com/api/file/$id/info" | jq -r '.hash_sha256 // empty')
+            [ -n "$remote_sha" ] && break; sleep 10
+          done
+          if [ -z "$remote_sha" ]; then
+            echo "No server hash, re-downloading to compare"
+            remote_sha=$(curl -sSL "https://pixeldrain.com/api/file/$id" | sha256sum | cut -d' ' -f1)
+          fi
+          [ "$local_sha" = "$remote_sha" ] || { echo "::error::Pixeldrain hash mismatch $local_sha vs $remote_sha"; exit 1; }
+          echo "Pixeldrain hash verified"
+          echo "### Done: https://pixeldrain.com/u/$id" >> "$GITHUB_STEP_SUMMARY"
+          echo "sha256: \`$local_sha\`" >> "$GITHUB_STEP_SUMMARY"
