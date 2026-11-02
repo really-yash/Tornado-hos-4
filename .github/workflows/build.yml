@@ -1,0 +1,226 @@
+name: Build TORNADO_HOS4_CN_BY_YASH
+
+on:
+  workflow_dispatch:
+    inputs:
+      super_direct_url:
+        description: "Optional direct URL of super.img (use if gofile auto-resolve fails)"
+        required: false
+        default: ""
+      allow_missing:
+        description: "Continue even if some images are not found in stock payload"
+        type: boolean
+        default: false
+      upload:
+        description: "Upload to Pixeldrain"
+        type: boolean
+        default: true
+
+env:
+  PKG: TORNADO_HOS4_CN_BY_YASH
+  STOCK_URL: https://bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com/OS3.0.309.0.WPOINXM/tornado_in_global-ota_full-OS3.0.309.0.WPOINXM-user-16.0-6fee62fee2.zip
+  GOFILE_SUPER: https://gofile.io/d/6xRyEUfp
+  GOFILE_WIN: https://gofile.io/d/LfNQLjUj
+  GOFILE_LINUX: https://gofile.io/d/n1kceeoc
+  GOFILE_MAC: https://gofile.io/d/1gdutGk4
+  WORK: /mnt/work
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space and prepare workdir
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo mkdir -p "$WORK" && sudo chown "$USER" "$WORK"
+          mkdir -p "$WORK"/{dl,stock,stage,bin_dl}
+          df -h / /mnt
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2 zip unzip jq xxd android-sdk-libsparse-utils python3-requests
+          gh release download --repo ssut/payload-dumper-go --pattern '*linux_amd64.tar.gz' --dir /tmp
+          tar -xzf /tmp/payload-dumper-go*linux_amd64.tar.gz -C /tmp
+          sudo install -m755 "$(find /tmp -name payload-dumper-go -type f | head -1)" /usr/local/bin/payload-dumper-go
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      # ---------- gofile helper with fallback ----------
+      - name: Fetch super.img from gofile
+        env:
+          SUPER_DIRECT: ${{ inputs.super_direct_url }}
+        run: |
+          cd "$WORK/dl"
+          if [ -n "$SUPER_DIRECT" ]; then
+            aria2c -x8 -s8 -k4M --retry-wait=5 --max-tries=10 -o super.img "$SUPER_DIRECT"
+          else
+            python3 "$GITHUB_WORKSPACE/tools/gofile_fetch.py" "$GOFILE_SUPER" . --only super.img || rc=$?
+            if [ "${rc:-0}" = 3 ]; then
+              echo "::warning::Own resolver failed, trying gofile-downloader fallback"
+              pip install -q gofile-downloader
+              mkdir -p fb && (cd fb && gofile-downloader "$GOFILE_SUPER")
+              found=$(find fb -name super.img -type f | head -1)
+              [ -n "$found" ] && mv "$found" super.img || { echo "::error::Could not download super.img. Re-run with super_direct_url."; exit 1; }
+            elif [ "${rc:-0}" != 0 ]; then
+              echo "::error::super.img failed size/md5 verification (corrupt download)"; exit 1
+            fi
+          fi
+          ls -l super.img
+
+      - name: Validate super.img (sparse chain + full decode + LP geometry)
+        run: python3 tools/check_super.py "$WORK/dl/super.img" "$WORK/dl/super_raw.img"
+
+      - name: Fetch and validate bin/ tools
+        run: |
+          fetch() { # name url
+            local d="$WORK/bin_dl/$1"; mkdir -p "$d"
+            python3 tools/gofile_fetch.py "$2" "$d" || rc=$?
+            if [ "${rc:-0}" = 3 ]; then
+              pip install -q gofile-downloader
+              (mkdir -p "$d/fb" && cd "$d/fb" && gofile-downloader "$2")
+              find "$d/fb" -type f -exec mv -n {} "$d"/ \; 
+            elif [ "${rc:-0}" != 0 ]; then echo "::error::$1 download verification failed"; exit 1; fi
+          }
+          fetch windows "$GOFILE_WIN"
+          fetch linux   "$GOFILE_LINUX"
+          fetch macos   "$GOFILE_MAC"
+          B="$WORK/bin_dl"
+          for f in AdbWinApi.dll AdbWinUsbApi.dll fastboot.exe; do
+            [ -s "$B/windows/$f" ] || { echo "::error::windows/$f missing"; exit 1; }
+          done
+          [ "$(head -c2 "$B/windows/fastboot.exe")" = "MZ" ] || { echo "::error::windows fastboot.exe is not a PE file"; exit 1; }
+          [ "$(head -c4 "$B/linux/fastboot" | xxd -p)" = "7f454c46" ] || { echo "::error::linux/fastboot is not an ELF binary (wrong gofile link?)"; exit 1; }
+          case "$(head -c4 "$B/macos/fastboot" | xxd -p)" in
+            cffaedfe|feedfacf|cafebabe|bebafeca) ;;
+            *) echo "::error::macos/fastboot is not a Mach-O binary (macOS link currently equals the Linux link?)"; exit 1;;
+          esac
+          echo "bin tools OK"
+
+      # ---------- stock ROM ----------
+      - name: Download stock OTA and verify
+        run: |
+          cd "$WORK/stock"
+          aria2c -x16 -s16 -k4M --retry-wait=5 --max-tries=10 --file-allocation=none -o stock.zip "$STOCK_URL"
+          unzip -tq stock.zip
+          want=$(basename "$STOCK_URL" .zip | awk -F- '{print $NF}')
+          have=$(md5sum stock.zip | cut -c1-${#want})
+          if [ "$want" = "$have" ]; then echo "stock md5 prefix matches filename ($want)"
+          else echo "::warning::md5 prefix $have != filename hash $want (zip test passed, continuing)"; fi
+          unzip -o -q stock.zip payload.bin
+          rm stock.zip
+          ls -l payload.bin
+
+      - name: Build package folder
+        env:
+          ALLOW_MISSING: ${{ inputs.allow_missing }}
+        run: |
+          S="$WORK/stage/$PKG"
+          mkdir -p "$S/firmware-update" "$S/bin/windows" "$S/bin/linux" "$S/bin/macos"
+
+          # 1) bin
+          cp "$WORK"/bin_dl/windows/{AdbWinApi.dll,AdbWinUsbApi.dll,fastboot.exe} "$S/bin/windows/"
+          cp "$WORK/bin_dl/linux/fastboot" "$S/bin/linux/"
+          cp "$WORK/bin_dl/macos/fastboot" "$S/bin/macos/"
+          chmod +x "$S/bin/linux/fastboot" "$S/bin/macos/fastboot"
+
+          # 2) scripts: normalise line endings, force vbmeta verity/verification OFF
+          cp scripts/linux_fastboot_install.sh scripts/macos_fastboot_install.sh scripts/windows_fastboot_install.bat "$S/"
+          sed -i 's/\r$//' "$S"/*.sh
+          sed -i 's/\r$//; s/$/\r/' "$S/windows_fastboot_install.bat"
+          for f in "$S"/*.sh "$S/windows_fastboot_install.bat"; do
+            sed -i -E '/--disable-verity/! s/ flash (vbmeta)/ --disable-verity --disable-verification flash \1/' "$f"
+            n=$(grep -c -- '--disable-verity --disable-verification flash vbmeta' "$f")
+            [ "$n" = 6 ] || { echo "::error::$f: expected 6 vbmeta flash lines patched, got $n"; exit 1; }
+          done
+          chmod +x "$S"/*.sh
+
+          # 3) image list straight from the scripts (everything except super.img)
+          grep -ohE 'firmware-update[/\\][A-Za-z0-9_.-]+' "$S"/*.sh "$S/windows_fastboot_install.bat" \
+            | sed -E 's#.*[/\\]##' | sort -u | grep -vx 'super.img' > "$WORK/needed.txt"
+          echo "Images needed from stock:"; cat "$WORK/needed.txt"
+
+          # 4) extract from payload.bin
+          mkdir -p "$WORK/ext"; missing=()
+          while read -r name; do
+            part="${name%.*}"
+            payload-dumper-go -p "$part" -o "$WORK/ext" "$WORK/stock/payload.bin" >/dev/null 2>&1 || true
+            if [ -s "$WORK/ext/$part.img" ]; then
+              mv "$WORK/ext/$part.img" "$S/firmware-update/$name"
+              echo "ok  $name"
+            else
+              echo "MISSING $name"; missing+=("$name")
+            fi
+          done < "$WORK/needed.txt"
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::warning::Not found in stock payload: ${missing[*]}"
+            [ "$ALLOW_MISSING" = "true" ] || { echo "::error::Missing images (re-run with allow_missing, or take them from a fastboot ROM): ${missing[*]}"; exit 1; }
+          fi
+          rm -f "$WORK/stock/payload.bin"
+
+          # 5) your super.img
+          mv "$WORK/dl/super.img" "$S/firmware-update/super.img"
+
+      - name: Cross-check everything referenced by the scripts exists and is real data
+        run: |
+          S="$WORK/stage/$PKG"; fail=0
+          for sc in "$S"/*.sh "$S/windows_fastboot_install.bat"; do
+            for n in $(grep -ohE 'firmware-update[/\\][A-Za-z0-9_.-]+' "$sc" | sed -E 's#.*[/\\]##' | sort -u); do
+              p="$S/firmware-update/$n"
+              if [ ! -s "$p" ]; then echo "MISSING/EMPTY: $n (used by $(basename "$sc"))"; fail=1; continue; fi
+              [ "$(head -c 4096 "$p" | tr -d '\0' | wc -c)" -gt 0 ] || { echo "ALL-ZERO HEADER: $n"; fail=1; }
+            done
+          done
+          if [ "$fail" = 1 ] && [ "${{ inputs.allow_missing }}" != "true" ]; then exit 1; fi
+          (cd "$S" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "$WORK/stage_manifest.txt"
+          wc -l "$WORK/stage_manifest.txt"
+          find "$S" | sed "s#$WORK/stage/##" | sort | head -80
+
+      - name: Zip and test
+        run: |
+          cd "$WORK/stage"
+          zip -r -1 -q "$WORK/$PKG.zip" "$PKG"
+          unzip -tq "$WORK/$PKG.zip"
+          diff <(unzip -Z1 "$WORK/$PKG.zip" | grep -v '/$' | sort) \
+               <(cd "$WORK/stage" && find "$PKG" -type f | sort) && echo "zip file list matches staging"
+          cd "$WORK" && sha256sum "$PKG.zip" | tee "$PKG.zip.sha256"
+          ls -lh "$PKG.zip"
+
+      - name: Upload checksums as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: checksums
+          path: |
+            /mnt/work/stage_manifest.txt
+            /mnt/work/TORNADO_HOS4_CN_BY_YASH.zip.sha256
+
+      - name: Upload to Pixeldrain and verify hash
+        if: ${{ inputs.upload }}
+        env:
+          PD_KEY: 3e97421d-e3b7-4fe1-8c8c-5dcd5201c7fa
+        run: |
+          [ -n "$PD_KEY" ] || { echo "::error::Pixeldrain API key missing"; exit 1; }
+          cd "$WORK"
+          resp=$(curl -sS --fail --retry 3 --retry-all-errors -u ":$PD_KEY" -T "$PKG.zip" "https://pixeldrain.com/api/file/$PKG.zip")
+          id=$(jq -r .id <<<"$resp"); [ -n "$id" ] && [ "$id" != null ] || { echo "upload failed: $resp"; exit 1; }
+          local_sha=$(cut -d' ' -f1 "$PKG.zip.sha256")
+          remote_sha=""
+          for i in 1 2 3 4 5 6; do
+            remote_sha=$(curl -sS "https://pixeldrain.com/api/file/$id/info" | jq -r '.hash_sha256 // empty')
+            [ -n "$remote_sha" ] && break; sleep 10
+          done
+          if [ -z "$remote_sha" ]; then
+            echo "No server hash, re-downloading to compare"
+            remote_sha=$(curl -sSL "https://pixeldrain.com/api/file/$id" | sha256sum | cut -d' ' -f1)
+          fi
+          [ "$local_sha" = "$remote_sha" ] || { echo "::error::Pixeldrain hash mismatch $local_sha vs $remote_sha"; exit 1; }
+          echo "Pixeldrain hash verified"
+          echo "### Done: https://pixeldrain.com/u/$id" >> "$GITHUB_STEP_SUMMARY"
+          echo "sha256: \`$local_sha\`" >> "$GITHUB_STEP_SUMMARY"
